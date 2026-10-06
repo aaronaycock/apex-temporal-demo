@@ -1,0 +1,321 @@
+# Apex Temporal Demo
+
+Ephemeral AWS test environments provisioned by Terraform and orchestrated by [Temporal](https://temporal.io).
+
+One command builds a VPC, an EC2 instance running nginx, and an app marker, then health-checks the instance over HTTP. If anything fails along the way, the workflow tears down whatever it already built. If the worker crashes mid-deploy, the workflow resumes where it left off when the worker comes back.
+
+The point of the demo: Terraform knows how to change infrastructure, but not how to run a multi-step deploy reliably. Temporal supplies the missing pieces (ordering, retries, rollback, crash recovery, timers, and a full audit trail) as plain Python code.
+
+## What it demonstrates
+
+| Capability | Where you see it |
+|---|---|
+| **Durable orchestration** | Network, compute, and app modules run in order, each as a child workflow with its own event history. |
+| **Saga rollback** | A failure at any step, or cancelling the workflow, runs a compensating teardown, including for a module that failed partway through. |
+| **Crash recovery** | Kill the worker with `kill -9` mid-deploy; on restart it continues without rebuilding finished modules. |
+| **Retries with backoff** | The HTTP health check retries connection errors and 5xx responses until the instance finishes booting. Permanent Terraform errors fail fast instead. |
+| **Idempotent teardown** | Teardown reads Terraform state first and skips empty modules, so running it twice is safe. |
+| **Durable timers** | `--ttl` keeps an environment alive for N seconds and then destroys it, even across worker restarts. |
+| **Signals and queries** | During a TTL wait, the `status` query reports the URL and expiry, and the `extend_ttl` and `teardown_now` signals change the timer. |
+| **Observability** | Every step is visible in the Temporal UI; worker metrics are exposed in Prometheus format. |
+
+## How it works
+
+```mermaid
+flowchart TD
+    CLI["apex.sh / starter.py"] -->|start workflow| D[DeployTestInstance]
+    D --> N["ProvisionModule: network<br/>VPC, subnet, IGW, SG"]
+    N --> C["ProvisionModule: compute<br/>EC2 t3.micro + nginx"]
+    C --> A["ProvisionModule: app<br/>null_resource marker"]
+    A --> H["http_health_check<br/>retries until 2xx"]
+    H --> OK([healthy])
+    N -. failure .-> R["TeardownInstance<br/>app, compute, network"]
+    C -. failure .-> R
+    A -. failure .-> R
+    H -. failure .-> R
+```
+
+Each `ProvisionModule` child runs `terraform plan` and, if the plan has changes, `terraform apply`. It then returns the module's outputs, so compute gets the subnet and security group IDs that network created.
+
+The activities shell out to the `terraform` CLI in a per-environment workspace at `terraform/_workspaces/<env>/<module>/`. State lives in S3 at `s3://$TF_STATE_BUCKET/apex-temporal-demo/<env>/<module>.tfstate`, protected by S3 native state locking.
+
+**Workflows** (all on task queue `nonprod-provisioning`):
+
+| Workflow | Started by | Workflow ID |
+|---|---|---|
+| `DeployTestInstance` | `starter.py` | `deploy-<env>` |
+| `ProvisionModule` | child of deploy and swap | `provision-<module>-<env>` |
+| `SwapInstance` | `swapper.py` | `swap-<env>-<version>` |
+| `TeardownInstance` | `teardown.py`, rollback, TTL | `teardown-<env>`, `rollback-<env>-<ts>`, `teardown-ttl-<env>` |
+
+## Prerequisites
+
+- **Python 3.12+**
+- **Terraform 1.10+** (for S3 native state locking)
+- **Docker** (for the local Temporal server), or the [Temporal CLI](https://docs.temporal.io/cli)
+- **AWS credentials** for an account where you can create VPCs and EC2 instances. Any standard method works (`aws configure`, SSO, environment variables).
+- **An S3 bucket** for Terraform state (created in step 2 below)
+
+> **Cost and limits:** each environment creates one VPC and one `t3.micro` in **us-east-1**. AWS allows 5 VPCs per region by default. Tear environments down when you're done.
+
+## Quick start
+
+### 1. Install
+
+```bash
+git clone git@github.com:aaronaycock/apex-temporal-demo.git
+cd apex-temporal-demo
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+```
+
+### 2. Create a state bucket
+
+Bucket names are global, so pick a unique one:
+
+```bash
+BUCKET=apex-tf-state-$(whoami)-$RANDOM
+aws s3api create-bucket --bucket "$BUCKET" --region us-east-1
+aws s3api put-bucket-versioning --bucket "$BUCKET" --versioning-configuration Status=Enabled
+echo "TF_STATE_BUCKET=$BUCKET"
+```
+
+Put the printed value in `.env`.
+
+### 3. Start Temporal
+
+```bash
+docker compose up -d
+```
+
+This starts Temporal with Postgres and the Temporal UI at **http://localhost:8233**.
+
+If you'd rather not use Docker, `temporal server start-dev` works too and serves the UI on the same port.
+
+### 4. Check your setup
+
+```bash
+python check.py
+```
+
+```
+[ok  ] terraform on PATH: Terraform v1.14.9
+[ok  ] module network
+[ok  ] module compute
+[ok  ] module app
+[ok  ] AWS credentials: arn:aws:iam::123456789012:user/you
+[ok  ] state bucket: s3://apex-tf-state-you-12345
+[ok  ] Temporal server: localhost:7233 (default)
+```
+
+### 5. Run the worker
+
+In its own terminal:
+
+```bash
+source .venv/bin/activate
+python worker.py
+```
+
+### 6. Provision an environment
+
+In a second terminal:
+
+```bash
+source .venv/bin/activate
+./apex.sh
+```
+
+Choose **Provision → Standard → ephemeral-test-01**. When the workflow finishes, it prints the instance URL; open it to see the nginx page. Follow the workflow live in the UI at http://localhost:8233.
+
+## Demo walkthrough
+
+Each scenario can be run from the `./apex.sh` menu or with the command shown. A good order for a live demo:
+
+### 1. Happy path
+
+```bash
+python starter.py ephemeral-test-01
+```
+
+In the UI, open `deploy-ephemeral-test-01` and point out:
+
+- The three child workflows, which run in order.
+- The health check failing and retrying while the instance boots.
+- The result, which contains the URL.
+
+### 2. Rolling update
+
+```bash
+python swapper.py ephemeral-test-01 v2
+```
+
+Swap reads the network outputs from state, then re-applies compute with `app_version=v2`. The changed user data forces Terraform to replace the instance. The new instance gets a new public IP, and its page reads `v2`.
+
+### 3. Saga rollback
+
+```bash
+python starter.py fail-network-01 --fail-after-network
+```
+
+The network module builds, then the workflow fails on purpose. A `rollback-fail-network-01-<ts>` child destroys the network, and the deploy ends as **Failed** instead of retrying forever. Afterwards, the AWS console shows no `apex-fail-network-01-*` resources.
+
+### 4. Crash recovery
+
+```bash
+python starter.py chaos-test-01
+```
+
+Any env name starting with `chaos-` adds a 30-second heartbeating step between network and compute. During that window:
+
+1. Kill the worker: `pkill -9 -f worker.py`, or use `kill -9 <pid>`.
+2. In the UI, the activity stops heartbeating and times out after about 10 seconds.
+3. Restart the worker: `python worker.py`.
+4. The workflow picks up at the step that was interrupted and goes straight on to compute. Network is **not** rebuilt, because its completed result is already in the workflow history.
+
+### 5. Self-destructing environment
+
+```bash
+python starter.py ephemeral-test-02 --ttl 300
+```
+
+After the deploy passes its health check, the starter prints the URL and expiry time, and the workflow waits on a durable timer for 5 minutes before tearing down. You can Ctrl-C the starter (the workflow keeps running on the server) or even restart the worker; the timer still fires.
+
+While it waits, query and signal the running workflow with the [Temporal CLI](https://docs.temporal.io/cli), or from the workflow's page in the UI:
+
+```bash
+temporal workflow query  --workflow-id deploy-ephemeral-test-02 --name status
+temporal workflow signal --workflow-id deploy-ephemeral-test-02 --name extend_ttl --input 600
+temporal workflow signal --workflow-id deploy-ephemeral-test-02 --name teardown_now
+```
+
+Cancelling the workflow instead (`temporal workflow cancel --workflow-id deploy-ephemeral-test-02`, or **Request Cancellation** in the UI) also tears the environment down, and the run ends as **Canceled**.
+
+### 6. Cleanup and idempotency
+
+```bash
+python teardown.py ephemeral-test-01
+python teardown.py ephemeral-test-01   # second run: every module "skipped (state empty)"
+```
+
+## Command reference
+
+| Command | Purpose |
+|---|---|
+| `./apex.sh` | Interactive menu for provision, swap, and teardown. Prints the command before running it. |
+| `python starter.py [ENV] [--ttl SECONDS] [--fail-after-network]` | Provision an environment (default `ephemeral-test-01`). |
+| `python swapper.py ENV VERSION` | Replace the instance with a new app version. |
+| `python teardown.py ENV` | Destroy an environment. Safe to re-run. |
+| `temporal workflow signal --workflow-id deploy-ENV --name extend_ttl --input SECONDS` | Push back a TTL teardown. `--name teardown_now` (no input) tears down immediately. |
+| `python check.py` | Preflight check of tools, AWS access, state bucket, and Temporal. |
+| `python worker.py` | Run the worker. Metrics at http://localhost:9090/metrics. |
+| `scripts/reset.sh ENV` | Break-glass cleanup that runs Terraform directly, without Temporal. |
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The suite takes about 30 seconds and needs no AWS account, Terraform, or running Temporal server:
+
+- **Workflow tests** run the real workflows on a throwaway Temporal dev server, with the Terraform and HTTP activities swapped for in-memory mocks. They cover the TTL query and signals, cancelling during the TTL wait and mid-apply, failure rollback, and swap. Each test then replays its workflow histories against the current code to catch non-determinism. The dev server comes from the `temporal` CLI if it's on your PATH; otherwise the SDK downloads it on the first run.
+- **Activity tests** run the Terraform activities against a fake `terraform` script (`tests/bin/terraform`, bash, so macOS or Linux) and the health check against a local HTTP server. They cover error classification, re-planning on retry, interrupting `terraform` on cancel, and health status codes.
+
+Run `pytest` before changing a workflow. If a replay check fails, the change would break workflows already running; see [versioning](https://docs.temporal.io/develop/python/versioning).
+
+## Project layout
+
+```
+.
+├── worker.py                  Temporal worker: registers all workflows and activities
+├── starter.py                 Start a deploy
+├── swapper.py                 Start an app version swap
+├── teardown.py                Start a teardown
+├── check.py                   Preflight checks
+├── apex.sh                    Interactive demo menu
+├── workflows/
+│   ├── deploy_test_instance.py   Parent: network, compute, app, health, rollback, TTL
+│   ├── provision_module.py       Child: plan, then apply if needed
+│   ├── swap_instance.py          Re-apply compute with a new app version
+│   └── teardown_instance.py      Destroy in reverse order, skipping empty state
+├── activities/
+│   ├── terraform.py           terraform init/plan/apply/destroy/output via subprocess
+│   └── health.py              HTTP health check
+├── shared/
+│   ├── config.py              Settings loaded from .env
+│   └── idempotency.py         Deterministic per-activity idempotency key
+├── terraform/modules/
+│   ├── network/               VPC, public subnet, IGW, route table, HTTP security group
+│   ├── compute/               t3.micro (Amazon Linux 2023) with nginx via user data
+│   └── app/                   null_resource marker for future app deploy logic
+├── scripts/
+│   ├── render_prometheus.py   Render prometheus.yml from the template and .env
+│   └── reset.sh               Break-glass Terraform cleanup
+├── tests/
+│   ├── conftest.py            Throwaway Temporal dev server shared by the workflow tests
+│   ├── test_workflows.py      Real workflows with mocked activities, plus replay checks
+│   ├── test_terraform_activities.py   Terraform activities against a fake terraform
+│   ├── test_health_activity.py        Health check against a local HTTP server
+│   └── bin/terraform          Fake terraform CLI used by the activity tests
+├── pytest.ini                 Test settings
+├── requirements-dev.txt       Runtime requirements plus pytest
+└── docker-compose.yml         Temporal, Postgres, Temporal UI, optional Prometheus
+```
+
+## Configuration
+
+Settings come from `.env` (see `.env.example`):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TF_STATE_BUCKET` | *(required)* | S3 bucket for Terraform state |
+| `TF_STATE_REGION` | `us-east-1` | Region of the state bucket |
+| `TEMPORAL_ADDRESS` | `localhost:7233` | Temporal frontend |
+| `TEMPORAL_NAMESPACE` | `default` | Temporal namespace |
+| `TEMPORAL_TASK_QUEUE_NONPROD` | `nonprod-provisioning` | Task queue the worker polls |
+| `GRAFANA_PROM_*` | | Grafana Cloud remote write, only for the metrics profile |
+
+AWS resources are always created in **us-east-1**; the region is set in the Terraform modules.
+
+## Optional: metrics in Grafana Cloud
+
+The worker always serves Prometheus metrics on `:9090`. To ship them to Grafana Cloud, fill in the `GRAFANA_PROM_*` values in `.env`, then run:
+
+```bash
+python scripts/render_prometheus.py      # writes prometheus.yml (gitignored, contains your key)
+docker compose --profile metrics up -d
+```
+
+Prometheus scrapes the worker through `host.docker.internal:9090` and remote-writes to Grafana. Its own UI is at http://localhost:9091.
+
+## Design notes
+
+- **S3 native state locking, no DynamoDB.** Workflow IDs stop a second deploy of the same environment, but deploy, swap, and teardown use different IDs and can overlap on the same state. Each module's backend sets `use_lockfile = true`, so overlapping plans, applies, and destroys wait up to 2 minutes for the S3 lock, then the activity retries. Each plan also writes its own plan file, so one workflow can't apply another's plan.
+- **Retries match the failure.** Permanent Terraform failures (bad config, bad credentials, a missing bucket, an AWS quota) are non-retryable and fail on the first attempt. Lock contention, throttling, and a stale plan retry with backoff, and a retried apply re-plans from current state first.
+- **Cancelling tears down too.** Cancelling a deploy interrupts any running `terraform` with SIGINT, so it saves state and releases the lock, then runs the same teardown as a failure. The run ends as **Canceled**, not Failed.
+- **Idempotency keys.** Each activity derives a key from its workflow run ID and activity ID (`shared/idempotency.py`). The key stays the same across retries of that activity and is applied to AWS resources as the `ApexIdempotencyKey` tag, so you can trace any resource back to the activity that last touched it. Side effect: the tag changes on every new run, so a plan against existing infrastructure always shows tag updates and is never a no-op.
+- **Rollback is best-effort and never hides the cause.** If the compensating teardown itself fails, the deploy still reports the original error and logs a hint to run `teardown.py`.
+- **State is kept after teardown.** Destroy empties the state files but doesn't delete them, which leaves an audit trail in S3.
+
+## Limitations
+
+- **Plan files are local to the worker.** If apply runs on a different host than its plan, or is a retry, it re-plans from current state and applies that plan instead of the one the plan step showed.
+- **Don't kill the worker during `terraform apply`.** The retry re-plans, so a stale plan no longer fails the deploy. But `kill -9` on the worker also breaks the output pipe of the `terraform` process it started, which can kill it mid-apply, leaving a stale state lock and resources Terraform didn't record. The chaos demo's 30-second window exists so you can kill the worker at a safe point.
+- **Swap leaves the app marker unchanged.** Only compute moves to the new version; the `app` module still reports `v1`.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `TF_STATE_BUCKET is not set` at worker start | Copy `.env.example` to `.env` and set the bucket. |
+| `Workflow 'deploy-X' is already running` | Wait for it, terminate it in the UI, or choose another env name. |
+| Workflow stuck with nothing happening | The worker isn't running, or it's polling a different task queue. Check `python worker.py` output. |
+| `terraform init failed` | Credentials expired or no access to the bucket. Run `python check.py`. |
+| Health check exhausts its retries | The instance didn't serve HTTP within 5 minutes (connection errors and 5xx retry; a 4xx fails at once). Check the EC2 console and system log for user-data errors. |
+| `Error acquiring the state lock` on every retry | A crashed run, usually a `kill -9` during apply, left a lock in S3. Confirm nothing is running, then run `terraform force-unlock <LOCK_ID>` in `terraform/_workspaces/<env>/<module>/`. The lock ID is in the error. |
+| `VpcLimitExceeded` | Tear down old environments, or raise the VPC quota for us-east-1. |
+| Temporal or worker is down and resources need removing | `scripts/reset.sh ENV` on the machine that ran the worker; otherwise delete the `apex-<env>-*` resources in the AWS console. |

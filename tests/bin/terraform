@@ -1,0 +1,20 @@
+#!/bin/bash
+# Fake terraform for tests/test_terraform_activities.py. Logs each call (with
+# TF_CLI_ARGS) to $FAKE_TF_LOG; FAKE_TF_* env vars pick the behavior.
+trap 'echo "SIGINT received" >> "$FAKE_TF_LOG"; exit 1' INT
+echo "$* | TF_CLI_ARGS=$TF_CLI_ARGS" >> "$FAKE_TF_LOG"
+cmd="$1"; shift
+case "$cmd" in
+  init) exit 0 ;;
+  plan)
+    # Write the -out file and report "changes present" (-detailed-exitcode 2).
+    while [ $# -gt 0 ]; do [ "$1" = "-out" ] && touch "$2"; shift; done
+    exit 2 ;;
+  apply)
+    if [ -n "$FAKE_TF_APPLY_ERR" ]; then echo "$FAKE_TF_APPLY_ERR" >&2; exit 1; fi
+    # Short sleeps so the INT trap runs promptly.
+    for _ in $(seq 1 "${FAKE_TF_APPLY_SLEEP:-0}"); do sleep 0.2; done
+    exit 0 ;;
+  output) echo '{"subnet_id":{"value":"subnet-1"}}'; exit 0 ;;
+  destroy) exit 0 ;;
+esac

@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 15s
+  external_labels:
+    source: apex-temporal-demo
+
+remote_write:
+  - url: ${GRAFANA_PROM_REMOTE_WRITE_URL}
+    basic_auth:
+      username: ${GRAFANA_PROM_USERNAME}
+      password: ${GRAFANA_PROM_API_KEY}
+
+scrape_configs:
+  - job_name: temporal-worker
+    static_configs:
+      - targets: ['host.docker.internal:9090']
+        labels:
+          service: worker
