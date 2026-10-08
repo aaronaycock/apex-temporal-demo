@@ -16,5 +16,10 @@ case "$cmd" in
     for _ in $(seq 1 "${FAKE_TF_APPLY_SLEEP:-0}"); do sleep 0.2; done
     exit 0 ;;
   output) echo '{"subnet_id":{"value":"subnet-1"}}'; exit 0 ;;
+  show)
+    # `show -json PLAN`: the plan in $FAKE_TF_SHOW_JSON, or one VPC to create.
+    default='{"resource_changes":[{"address":"aws_vpc.main","change":{"actions":["create"],"before":null,"after":{"cidr_block":"10.0.0.0/16"}}}]}'
+    echo "${FAKE_TF_SHOW_JSON:-$default}"
+    exit 0 ;;
   destroy) exit 0 ;;
 esac

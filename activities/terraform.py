@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import shlex
@@ -54,6 +55,8 @@ class PlanResult:
     has_changes: bool
     diff_summary: str
     current_outputs: dict
+    # Only set when the plan was requested with summarize=True (approval mode).
+    summary: dict | None = None
 
 
 @dataclass
@@ -175,6 +178,54 @@ async def _plan(wd: Path, tf_vars: dict, plan_file: str, heartbeat: bool = False
     return rc == 2, "\n".join(out.splitlines()[-15:])
 
 
+# Cap on resource addresses kept in a plan summary, so a large plan can't bloat
+# workflow history. The counts and fingerprint still cover every change.
+MAX_SUMMARY_ADDRESSES = 50
+
+_ACTION_SYMBOLS = {"create": "+", "update": "~", "delete": "-", "replace": "-/+"}
+_ACTION_COUNTS = {"create": "add", "update": "change", "delete": "destroy"}
+
+
+def _summarize_plan(plan_json: dict, idempotency_key: str) -> dict:
+    """Small, comparable summary of a `terraform show -json` plan: add/change/
+    destroy counts, the changed resource addresses, and a fingerprint of the
+    full changes. The fingerprint ignores the idempotency key, which differs on
+    every plan, so two plans of the same change from the same state match."""
+    counts = {"add": 0, "change": 0, "destroy": 0}
+    resources: list[str] = []
+    changes = []
+    for rc in plan_json.get("resource_changes", []):
+        actions = rc["change"]["actions"]
+        if actions in (["no-op"], ["read"]):
+            continue
+        if "create" in actions and "delete" in actions:
+            kind = "replace"
+            counts["add"] += 1
+            counts["destroy"] += 1
+        else:
+            kind = actions[0]
+            if kind in _ACTION_COUNTS:
+                counts[_ACTION_COUNTS[kind]] += 1
+        # Anything else (e.g. "forget") is still listed and fingerprinted.
+        resources.append(f"{_ACTION_SYMBOLS.get(kind, kind)} {rc['address']}")
+        changes.append([rc["address"], actions, *(rc["change"].get(k) for k in ("before", "after", "after_unknown"))])
+    canonical = json.dumps(sorted(changes, key=lambda c: c[0]), sort_keys=True)
+    if idempotency_key:
+        canonical = canonical.replace(idempotency_key, "<idempotency_key>")
+    return {
+        **counts,
+        "resources": sorted(resources, key=lambda r: r.split(" ", 1)[1])[:MAX_SUMMARY_ADDRESSES],
+        "fingerprint": hashlib.sha256(canonical.encode()).hexdigest()[:16],
+    }
+
+
+async def _show_summary(wd: Path, plan_file: str, idempotency_key: str, heartbeat: bool = False) -> dict:
+    rc, out, err = await _run(["terraform", "show", "-json", plan_file], wd, heartbeat=heartbeat)
+    if rc != 0:
+        raise _tf_error("show", err)
+    return _summarize_plan(json.loads(out), idempotency_key)
+
+
 def _plan_file(key: str) -> str:
     # One plan file per activity, so two workflows planning the same module
     # can't overwrite each other's plan before it's applied.
@@ -182,7 +233,7 @@ def _plan_file(key: str) -> str:
 
 
 @activity.defn
-async def run_terraform_plan(module: str, env: str, tf_vars: dict) -> PlanResult:
+async def run_terraform_plan(module: str, env: str, tf_vars: dict, summarize: bool = False) -> PlanResult:
     key = idempotency_key(f"plan:{module}:{env}")
     activity.logger.info(f"plan idempotency key: {key}")
 
@@ -190,7 +241,8 @@ async def run_terraform_plan(module: str, env: str, tf_vars: dict) -> PlanResult
     plan_file = _plan_file(key)
 
     await _init(module, env, wd)
-    has_changes, summary = await _plan(wd, {**tf_vars, "idempotency_key": key}, plan_file)
+    has_changes, diff_summary = await _plan(wd, {**tf_vars, "idempotency_key": key}, plan_file)
+    summary = await _show_summary(wd, plan_file, key) if summarize and has_changes else None
 
     # Always read current outputs so downstream modules can chain even when plan is a no-op.
     current_outputs: dict = {}
@@ -207,13 +259,20 @@ async def run_terraform_plan(module: str, env: str, tf_vars: dict) -> PlanResult
         env=env,
         plan_path=str(wd / plan_file),
         has_changes=has_changes,
-        diff_summary=summary,
+        diff_summary=diff_summary,
         current_outputs=current_outputs,
+        summary=summary,
     )
 
 
 @activity.defn
-async def run_terraform_apply(module: str, env: str, tf_vars: dict, plan_path: str) -> ApplyResult:
+async def run_terraform_apply(
+    module: str, env: str, tf_vars: dict, plan_path: str, approved_summary: dict | None = None
+) -> ApplyResult:
+    """Apply the saved plan. With approved_summary (approval mode), a re-plan
+    must match what was approved; otherwise this raises a non-retryable
+    PlanChangedError carrying the new summary and plan path, so the workflow
+    can ask for approval again instead of applying an unapproved plan."""
     key = idempotency_key(f"apply:{module}:{env}")
     activity.logger.info(f"apply idempotency key: {key} (plan_path={plan_path})")
 
@@ -227,6 +286,16 @@ async def run_terraform_apply(module: str, env: str, tf_vars: dict, plan_path: s
         await _init(module, env, wd, heartbeat=True)
         plan_path = str(wd / _plan_file(key))
         await _plan(wd, {**tf_vars, "idempotency_key": key}, plan_path, heartbeat=True)
+        if approved_summary is not None:
+            new_summary = await _show_summary(wd, plan_path, key, heartbeat=True)
+            if new_summary != approved_summary:
+                raise ApplicationError(
+                    f"re-planned {module}/{env} no longer matches the approved plan",
+                    new_summary,
+                    plan_path,
+                    type="PlanChangedError",
+                    non_retryable=True,
+                )
 
     rc, out, err = await _run(
         [
