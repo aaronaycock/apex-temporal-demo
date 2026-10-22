@@ -8,7 +8,7 @@ with workflow.unsafe.imports_passed_through():
     from activities.health import http_health_check
     from activities.terraform import simulate_long_step
 
-from workflows.provision_module import ProvisionModule
+from workflows.provision_module import DEFAULT_APPROVAL_TIMEOUT_SECONDS, ProvisionModule
 from workflows.teardown_instance import TeardownInstance
 
 
@@ -34,6 +34,10 @@ class DeployTestInstance:
     the same teardown, including during the TTL wait, and the run still ends
     as Canceled. Disable with `rollback_on_failure=False` for triage workflows
     where the partial state is the diagnostic.
+
+    With `require_approval`, each module whose plan has changes waits for a
+    human decision before it is applied (see ProvisionModule). A rejection or
+    timeout fails that module, which triggers the same rollback.
 
     The `status` query reports progress and the instance URL while the
     workflow runs. During a TTL wait, the `extend_ttl` signal pushes the
@@ -76,16 +80,21 @@ class DeployTestInstance:
         ttl_seconds: int = 0,
         rollback_on_failure: bool = True,
         fail_after_network: bool = False,
+        require_approval: bool = False,
+        approval_timeout_seconds: int = DEFAULT_APPROVAL_TIMEOUT_SECONDS,
     ) -> dict:
         workflow.logger.info(f"DeployTestInstance: {env_name}")
         self._env = env_name
+        # Appended to each child's args only when set, so a deploy without
+        # approval starts its children exactly as before.
+        approval_args = [True, approval_timeout_seconds] if require_approval else []
 
         try:
             # 1) Network
             self._phase = "provisioning-network"
             net_outputs = await workflow.execute_child_workflow(
                 ProvisionModule.run,
-                args=["network", env_name, {"env_name": env_name}],
+                args=["network", env_name, {"env_name": env_name}, *approval_args],
                 id=f"provision-network-{env_name}",
             )
             self._modules.append("network")
@@ -110,7 +119,7 @@ class DeployTestInstance:
             }
             compute_outputs = await workflow.execute_child_workflow(
                 ProvisionModule.run,
-                args=["compute", env_name, compute_inputs],
+                args=["compute", env_name, compute_inputs, *approval_args],
                 id=f"provision-compute-{env_name}",
             )
             self._modules.append("compute")
@@ -119,7 +128,7 @@ class DeployTestInstance:
             self._phase = "provisioning-app"
             await workflow.execute_child_workflow(
                 ProvisionModule.run,
-                args=["app", env_name, {"env_name": env_name, "app_version": "v1"}],
+                args=["app", env_name, {"env_name": env_name, "app_version": "v1"}, *approval_args],
                 id=f"provision-app-{env_name}",
             )
             self._modules.append("app")

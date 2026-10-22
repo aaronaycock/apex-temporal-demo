@@ -8,10 +8,18 @@ from datetime import datetime, timedelta
 
 import pytest
 from temporalio import activity
-from temporalio.client import Client, WorkflowExecutionStatus, WorkflowFailureError, WorkflowHandle
-from temporalio.exceptions import ApplicationError, CancelledError
+from temporalio.client import (
+    Client,
+    WorkflowExecutionStatus,
+    WorkflowFailureError,
+    WorkflowHandle,
+    WorkflowUpdateFailedError,
+)
+from temporalio.exceptions import ApplicationError, CancelledError, TemporalError
+from temporalio.service import RPCError
 from temporalio.worker import Replayer, Worker
 
+import approve
 import starter
 from activities.health import HealthResult
 from activities.terraform import ApplyResult, PlanResult
@@ -34,13 +42,32 @@ log: dict[str, list[str]] = {}        # "apply:network", "destroy:app", ... in o
 slow_applies: set[str] = set()        # "env/module" applies that run until cancelled
 
 
+# Approval mode: the plan summary for each module, and "env/module" -> the
+# summary a re-plan at apply time produces instead (the plan file went missing
+# and state moved on in the meantime).
+def summary(module: str, change: int = 0) -> dict:
+    return {"add": 1, "change": change, "destroy": 0, "resources": [f"+ {module}.main"], "fingerprint": module}
+
+
+replans: dict[str, dict] = {}
+apply_calls: dict[str, list[tuple]] = {}  # (module, plan_path, approved_summary) per call
+
+
 @activity.defn(name="run_terraform_plan")
-async def mock_plan(module: str, env: str, tf_vars: dict) -> PlanResult:
-    return PlanResult(module, env, f"/tmp/{module}.bin", True, "", {})
+async def mock_plan(module: str, env: str, tf_vars: dict, summarize: bool = False) -> PlanResult:
+    return PlanResult(module, env, f"/tmp/{module}.bin", True, "", {}, summary(module) if summarize else None)
 
 
 @activity.defn(name="run_terraform_apply")
-async def mock_apply(module: str, env: str, tf_vars: dict, plan_path: str) -> ApplyResult:
+async def mock_apply(
+    module: str, env: str, tf_vars: dict, plan_path: str, approved_summary: dict | None = None
+) -> ApplyResult:
+    apply_calls.setdefault(env, []).append((module, plan_path, approved_summary))
+    replanned = replans.get(f"{env}/{module}")
+    if approved_summary is not None and replanned and replanned != approved_summary:
+        raise ApplicationError(
+            "plan changed", replanned, f"/tmp/{module}-replanned.bin", type="PlanChangedError", non_retryable=True
+        )
     built.setdefault(env, set()).add(module)
     log.setdefault(env, []).append(f"apply:{module}")
     if f"{env}/{module}" in slow_applies:
@@ -101,10 +128,14 @@ def new_env(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:6]}"
 
 
-async def start_deploy(client: Client, tq: str, env: str, ttl: int = 0, fail: bool = False) -> WorkflowHandle:
-    return await client.start_workflow(
-        DeployTestInstance.run, args=[env, ttl, True, fail], id=f"deploy-{env}", task_queue=tq
-    )
+async def start_deploy(
+    client: Client, tq: str, env: str, ttl: int = 0, fail: bool = False, approval_timeout: int | None = None
+) -> WorkflowHandle:
+    """approval_timeout set: deploy with --require-approval and that timeout."""
+    args = [env, ttl, True, fail]
+    if approval_timeout is not None:
+        args += [True, approval_timeout]
+    return await client.start_workflow(DeployTestInstance.run, args=args, id=f"deploy-{env}", task_queue=tq)
 
 
 async def wait_for_status(handle: WorkflowHandle, predicate, timeout: float = 30) -> dict:
@@ -242,3 +273,136 @@ async def test_starter_prints_nothing_when_deploy_fails(client, tq, capsys):
     assert capsys.readouterr().out == ""
     with pytest.raises(WorkflowFailureError):
         await handle.result()
+
+
+async def wait_for_approval_request(client: Client, env: str, module: str, round: int = 1) -> dict:
+    """Wait until the module's child is waiting for approval round `round`."""
+    async with asyncio.timeout(30):
+        while True:
+            try:
+                state = await approve.show(client, env, module)
+                if state["status"] == "awaiting-approval" and state["round"] == round:
+                    return state
+            except RPCError:
+                pass  # child not started yet
+            await asyncio.sleep(0.1)
+
+
+def error_types(err: BaseException | None) -> list[str]:
+    """ApplicationError types along an error's cause chain."""
+    types = []
+    while err is not None:
+        if isinstance(err, ApplicationError):
+            types.append(err.type)
+        err = err.cause if isinstance(err, TemporalError) else err.__cause__
+    return types
+
+
+async def assert_failed_with(handle: WorkflowHandle, error_type: str) -> None:
+    with pytest.raises(WorkflowFailureError) as err:
+        await asyncio.wait_for(handle.result(), 30)
+    assert error_type in error_types(err.value)
+    assert (await handle.describe()).status == WorkflowExecutionStatus.FAILED
+
+
+async def test_approval_applies_each_module_after_approve(client, tq, capsys):
+    env = new_env("approve")
+    handle = await start_deploy(client, tq, env, approval_timeout=600)
+    watcher = asyncio.create_task(starter.print_approval_requests(client, env, poll_seconds=0.1))
+    try:
+        state = await wait_for_approval_request(client, env, "network")
+        assert state["summary"] == summary("network")
+        assert env not in log, "nothing is applied before approval"
+
+        # The starter prints the plan and the commands to decide it.
+        out = ""
+        async with asyncio.timeout(10):
+            while f"python approve.py {env} network --approve" not in out:
+                await asyncio.sleep(0.1)
+                out += capsys.readouterr().out
+        assert f"network/{env}: awaiting-approval" in out
+        assert "1 to add, 0 to change, 0 to destroy" in out and "+ network.main" in out
+
+        assert await approve.decide(client, env, "network", True, "looks good") == "approved"
+        # The decision is made, so a second one is rejected by the validator.
+        with pytest.raises(WorkflowUpdateFailedError):
+            await approve.decide(client, env, "network", False, "too late")
+
+        for module in ["compute", "app"]:
+            await wait_for_approval_request(client, env, module)
+            await approve.decide(client, env, module, True, "ok")
+        result = await asyncio.wait_for(handle.result(), 30)
+    finally:
+        watcher.cancel()
+
+    assert result["status"] == "healthy"
+    assert log[env] == ["apply:network", "apply:compute", "apply:app"]
+    assert apply_calls[env][0] == ("network", "/tmp/network.bin", summary("network"))
+    network = await approve.show(client, env, "network")
+    assert (network["status"], network["reason"]) == ("applied", "looks good")
+
+    await assert_replays(client, env)
+
+
+async def test_decide_rejected_when_not_waiting(client, tq):
+    env = new_env("approve-early")
+    # Without --require-approval the module never waits, so decide is refused.
+    await asyncio.wait_for((await start_deploy(client, tq, env)).result(), 30)
+    handle = client.get_workflow_handle(f"provision-network-{env}")
+    assert (await handle.query(ProvisionModule.plan_summary))["status"] == "applied"
+    with pytest.raises((WorkflowUpdateFailedError, RPCError)):
+        await approve.decide(client, env, "network", True, "")
+    await assert_replays(client, env)
+
+
+async def test_rejection_rolls_back(client, tq):
+    env = new_env("reject")
+    handle = await start_deploy(client, tq, env, approval_timeout=600)
+    await wait_for_approval_request(client, env, "network")
+    await approve.decide(client, env, "network", True, "")
+    await wait_for_approval_request(client, env, "compute")
+    assert await approve.decide(client, env, "compute", False, "wrong instance size") == "rejected"
+
+    await assert_failed_with(handle, "ApprovalRejected")
+    assert log[env] == ["apply:network", "destroy:network"], "compute never applied; network rolled back"
+    assert (await handle.query(DeployTestInstance.status))["phase"] == "rolled-back"
+    compute = await approve.show(client, env, "compute")
+    assert (compute["status"], compute["reason"]) == ("rejected", "wrong instance size")
+    await assert_replays(client, env)
+
+
+async def test_approval_timeout_rolls_back(client, tq):
+    env = new_env("approval-timeout")
+    handle = await start_deploy(client, tq, env, approval_timeout=1)
+    await assert_failed_with(handle, "ApprovalTimeout")
+    assert env not in log, "nothing applied"
+    assert (await handle.query(DeployTestInstance.status))["phase"] == "rolled-back"
+    assert (await approve.show(client, env, "network"))["status"] == "timed-out"
+    await assert_replays(client, env)
+
+
+async def test_changed_replan_needs_approval_again(client, tq):
+    env = new_env("reapprove")
+    changed = summary("network", change=1)
+    replans[f"{env}/network"] = changed
+    handle = await start_deploy(client, tq, env, approval_timeout=600)
+
+    await wait_for_approval_request(client, env, "network")
+    await approve.decide(client, env, "network", True, "first look")
+    # Apply re-planned, got a different plan, and refused to apply it.
+    state = await wait_for_approval_request(client, env, "network", round=2)
+    assert state["summary"] == changed
+    assert env not in log
+
+    await approve.decide(client, env, "network", True, "second look")
+    for module in ["compute", "app"]:
+        await wait_for_approval_request(client, env, module)
+        await approve.decide(client, env, module, True, "")
+    await asyncio.wait_for(handle.result(), 30)
+
+    assert [c for c in apply_calls[env] if c[0] == "network"] == [
+        ("network", "/tmp/network.bin", summary("network")),
+        ("network", "/tmp/network-replanned.bin", changed),
+    ], "the second apply uses the re-planned file and the newly approved summary"
+    assert log[env] == ["apply:network", "apply:compute", "apply:app"]
+    await assert_replays(client, env)

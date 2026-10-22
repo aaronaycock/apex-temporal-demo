@@ -16,6 +16,7 @@ The point of the demo: Terraform knows how to change infrastructure, but not how
 | **Retries with backoff** | The HTTP health check retries connection errors and 5xx responses until the instance finishes booting. Permanent Terraform errors fail fast instead. |
 | **Idempotent teardown** | Teardown reads Terraform state first and skips empty modules, so running it twice is safe. |
 | **Durable timers** | `--ttl` keeps an environment alive for N seconds and then destroys it, even across worker restarts. |
+| **Human approval** | `--require-approval` pauses each module after `terraform plan` until someone approves or rejects it with a workflow Update. The `plan_summary` query shows what would change. |
 | **Signals and queries** | During a TTL wait, the `status` query reports the URL and expiry, and the `extend_ttl` and `teardown_now` signals change the timer. |
 | **Observability** | Every step is visible in the Temporal UI; worker metrics are exposed in Prometheus format. |
 
@@ -35,7 +36,7 @@ flowchart TD
     H -. failure .-> R
 ```
 
-Each `ProvisionModule` child runs `terraform plan` and, if the plan has changes, `terraform apply`. It then returns the module's outputs, so compute gets the subnet and security group IDs that network created.
+Each `ProvisionModule` child runs `terraform plan` and, if the plan has changes, `terraform apply`. With `--require-approval`, it waits for an approve or reject decision between the two. It then returns the module's outputs, so compute gets the subnet and security group IDs that network created.
 
 The activities shell out to the `terraform` CLI in a per-environment workspace at `terraform/_workspaces/<env>/<module>/`. State lives in S3 at `s3://$TF_STATE_BUCKET/apex-temporal-demo/<env>/<module>.tfstate`, protected by S3 native state locking.
 
@@ -193,7 +194,45 @@ temporal workflow signal --workflow-id deploy-ephemeral-test-02 --name teardown_
 
 Cancelling the workflow instead (`temporal workflow cancel --workflow-id deploy-ephemeral-test-02`, or **Request Cancellation** in the UI) also tears the environment down, and the run ends as **Canceled**.
 
-### 6. Cleanup and idempotency
+### 6. Human approval
+
+```bash
+python starter.py ephemeral-test-03 --require-approval
+```
+
+Each module stops after `terraform plan` and waits for a decision before it applies anything. The starter prints the plan summary (add/change/destroy counts and resource addresses) and the commands to decide it:
+
+```
+Approval needed:
+network/ephemeral-test-03: awaiting-approval
+  plan: 6 to add, 0 to change, 0 to destroy
+    + aws_internet_gateway.this
+    ...
+  approve: python approve.py ephemeral-test-03 network --approve --reason "..."
+  reject:  python approve.py ephemeral-test-03 network --reject --reason "..."
+```
+
+In a second terminal (or **Approve/Reject a plan** in `./apex.sh`):
+
+```bash
+python approve.py ephemeral-test-03 network                       # show the plan again
+python approve.py ephemeral-test-03 network --approve --reason "CIDR checked"
+```
+
+Approve network, then reject compute:
+
+```bash
+python approve.py ephemeral-test-03 compute --reject --reason "wrong instance size"
+```
+
+The compute module fails with a non-retryable `ApprovalRejected` error, and the deploy rolls back the network it already built, exactly as in the saga rollback scenario. Things to point out:
+
+- The decision is a workflow **Update** named `decide`, so the reason is in the child's history, and `approve.py` gets an answer back. Its validator refuses a decision when the module isn't waiting, for example a second approval of the same plan.
+- `approve.py ENV MODULE` finds the child workflow (`provision-<module>-<env>`) for you. Without a flag it only shows the plan. The same summary is available from the CLI or the UI's **Queries** tab: `temporal workflow query --workflow-id provision-network-ephemeral-test-03 --name plan_summary`.
+- The wait is a durable timer: restart the worker and the module keeps waiting. With no decision within 24 hours (`--approval-timeout SECONDS` to change it) the module fails with `ApprovalTimeout` and the deploy rolls back. Try `--approval-timeout 60` and walk away.
+- What gets applied is what was approved. The saved plan file is applied as is. If it's gone at apply time (the worker restarted on a fresh disk, or apply ran on another host) or apply is retried, the module plans again. If the new plan's summary differs from the approved one, nothing is applied, and the module waits for a second approval of the new plan (`round 2` in the summary).
+
+### 7. Cleanup and idempotency
 
 ```bash
 python teardown.py ephemeral-test-01
@@ -205,7 +244,8 @@ python teardown.py ephemeral-test-01   # second run: every module "skipped (stat
 | Command | Purpose |
 |---|---|
 | `./apex.sh` | Interactive menu for provision, swap, and teardown. Prints the command before running it. |
-| `python starter.py [ENV] [--ttl SECONDS] [--fail-after-network]` | Provision an environment (default `ephemeral-test-01`). |
+| `python starter.py [ENV] [--ttl SECONDS] [--fail-after-network] [--require-approval [--approval-timeout SECONDS]]` | Provision an environment (default `ephemeral-test-01`). With `--require-approval`, each module plan with changes waits for `approve.py` (default timeout 24h). |
+| `python approve.py ENV MODULE [--approve \| --reject] [--reason TEXT]` | Show a module's plan waiting for approval, and approve or reject it. |
 | `python swapper.py ENV VERSION` | Replace the instance with a new app version. |
 | `python teardown.py ENV` | Destroy an environment. Safe to re-run. |
 | `temporal workflow signal --workflow-id deploy-ENV --name extend_ttl --input SECONDS` | Push back a TTL teardown. `--name teardown_now` (no input) tears down immediately. |
@@ -222,8 +262,8 @@ pytest
 
 The suite takes about 30 seconds and needs no AWS account, Terraform, or running Temporal server:
 
-- **Workflow tests** run the real workflows on a throwaway Temporal dev server, with the Terraform and HTTP activities swapped for in-memory mocks. They cover the TTL query and signals, cancelling during the TTL wait and mid-apply, failure rollback, and swap. Each test then replays its workflow histories against the current code to catch non-determinism. The dev server comes from the `temporal` CLI if it's on your PATH; otherwise the SDK downloads it on the first run.
-- **Activity tests** run the Terraform activities against a fake `terraform` script (`tests/bin/terraform`, bash, so macOS or Linux) and the health check against a local HTTP server. They cover error classification, re-planning on retry, interrupting `terraform` on cancel, and health status codes.
+- **Workflow tests** run the real workflows on a throwaway Temporal dev server, with the Terraform and HTTP activities swapped for in-memory mocks. They cover the TTL query and signals, cancelling during the TTL wait and mid-apply, failure rollback, swap, and approval (approve, reject, timeout, and re-approval when the plan changes before apply). Each test then replays its workflow histories against the current code to catch non-determinism. The dev server comes from the `temporal` CLI if it's on your PATH; otherwise the SDK downloads it on the first run.
+- **Activity tests** run the Terraform activities against a fake `terraform` script (`tests/bin/terraform`, bash, so macOS or Linux) and the health check against a local HTTP server. They cover error classification, re-planning on retry, plan summaries and comparing a re-plan with the approved plan, interrupting `terraform` on cancel, and health status codes.
 
 Run `pytest` before changing a workflow. If a replay check fails, the change would break workflows already running; see [versioning](https://docs.temporal.io/develop/python/versioning).
 
@@ -235,11 +275,12 @@ Run `pytest` before changing a workflow. If a replay check fails, the change wou
 ├── starter.py                 Start a deploy
 ├── swapper.py                 Start an app version swap
 ├── teardown.py                Start a teardown
+├── approve.py                 Show, approve, or reject a module plan
 ├── check.py                   Preflight checks
 ├── apex.sh                    Interactive demo menu
 ├── workflows/
 │   ├── deploy_test_instance.py   Parent: network, compute, app, health, rollback, TTL
-│   ├── provision_module.py       Child: plan, then apply if needed
+│   ├── provision_module.py       Child: plan, optional approval, then apply if needed
 │   ├── swap_instance.py          Re-apply compute with a new app version
 │   └── teardown_instance.py      Destroy in reverse order, skipping empty state
 ├── activities/
@@ -298,12 +339,14 @@ Prometheus scrapes the worker through `host.docker.internal:9090` and remote-wri
 - **Retries match the failure.** Permanent Terraform failures (bad config, bad credentials, a missing bucket, an AWS quota) are non-retryable and fail on the first attempt. Lock contention, throttling, and a stale plan retry with backoff, and a retried apply re-plans from current state first.
 - **Cancelling tears down too.** Cancelling a deploy interrupts any running `terraform` with SIGINT, so it saves state and releases the lock, then runs the same teardown as a failure. The run ends as **Canceled**, not Failed.
 - **Idempotency keys.** Each activity derives a key from its workflow run ID and activity ID (`shared/idempotency.py`). The key stays the same across retries of that activity and is applied to AWS resources as the `ApexIdempotencyKey` tag, so you can trace any resource back to the activity that last touched it. Side effect: the tag changes on every new run, so a plan against existing infrastructure always shows tag updates and is never a no-op.
+- **Approval summaries stay small.** The plan summary comes from `terraform show -json` but keeps only counts, at most 50 resource addresses, and a fingerprint of the full changes (ignoring the per-run idempotency key). That's what goes into workflow history and what a re-plan is compared against; the full plan stays on the worker's disk. Plans are only summarized with `--require-approval`.
 - **Rollback is best-effort and never hides the cause.** If the compensating teardown itself fails, the deploy still reports the original error and logs a hint to run `teardown.py`.
 - **State is kept after teardown.** Destroy empties the state files but doesn't delete them, which leaves an audit trail in S3.
 
 ## Limitations
 
-- **Plan files are local to the worker.** If apply runs on a different host than its plan, or is a retry, it re-plans from current state and applies that plan instead of the one the plan step showed.
+- **Plan files are local to the worker.** If apply runs on a different host than its plan, or is a retry, it re-plans from current state and applies that plan instead of the one the plan step showed. With `--require-approval`, that re-plan is applied only if its summary matches the approved one; otherwise it needs approval again.
+- **Approval is only for deploys.** `swapper.py` and teardown (including rollback) don't wait for approval.
 - **Don't kill the worker during `terraform apply`.** The retry re-plans, so a stale plan no longer fails the deploy. But `kill -9` on the worker also breaks the output pipe of the `terraform` process it started, which can kill it mid-apply, leaving a stale state lock and resources Terraform didn't record. The chaos demo's 30-second window exists so you can kill the worker at a safe point.
 - **Swap leaves the app marker unchanged.** Only compute moves to the new version; the `app` module still reports `v1`.
 

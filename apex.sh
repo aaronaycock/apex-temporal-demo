@@ -69,12 +69,16 @@ STANDARD_ENVS=("ephemeral-test-01" "ephemeral-test-02" "ephemeral-test-03")
 FAIL_ENVS=("fail-network-01" "fail-network-02")
 CHAOS_ENVS=("chaos-test-01" "chaos-test-02")
 
-action="$(prompt_choice "What do you want to run?" "Provision" "Swap app version" "Teardown")"
+action="$(prompt_choice "What do you want to run?" "Provision" "Approve/Reject a plan" "Swap app version" "Teardown")"
 
 case "$action" in
   Provision)
-    variation="$(prompt_choice "Variation:" "Standard" "Fail after network" "Chaos (kill -9 window)")"
+    variation="$(prompt_choice "Variation:" "Standard" "Fail after network" "Chaos (kill -9 window)" "Require approval")"
     case "$variation" in
+      "Require approval")
+        env="$(pick_env_name "${STANDARD_ENVS[@]}")"
+        args=("$env" "--require-approval")
+        ;;
       "Chaos (kill -9 window)")
         env="$(pick_env_name "${CHAOS_ENVS[@]}")"
         args=("$env")
@@ -89,6 +93,19 @@ case "$action" in
         ;;
     esac
     confirm_and_run "python starter.py ${args[*]}" python starter.py "${args[@]}"
+    ;;
+  "Approve/Reject a plan")
+    env="$(pick_env_name "${STANDARD_ENVS[@]}")"
+    module="$(prompt_choice "Module:" "network" "compute" "app")"
+    # Show the plan first; this fails if the module isn't running.
+    python approve.py "$env" "$module" || exit 1
+    echo
+    decision="$(prompt_choice "Decision:" "Approve" "Reject")"
+    read -r -p "Reason: " reason
+    flag="--approve"
+    [[ "$decision" == "Reject" ]] && flag="--reject"
+    confirm_and_run "python approve.py $env $module $flag --reason \"$reason\"" \
+      python approve.py "$env" "$module" "$flag" --reason "$reason"
     ;;
   "Swap app version")
     env="$(pick_env_name "${STANDARD_ENVS[@]}" "${CHAOS_ENVS[@]}")"
